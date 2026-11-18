@@ -365,6 +365,12 @@ namespace FFTriadBuddy
 
         public TriadDeckInstanceManual(TriadDeckInstanceManual copyFrom)
         {
+            CopyFrom(copyFrom);
+        }
+
+        /// <summary>Leaves the instance in the same state as <c>new TriadDeckInstanceManual(copyFrom)</c>.</summary>
+        internal void CopyFrom(TriadDeckInstanceManual copyFrom)
+        {
             deck = copyFrom.deck;
             numUnknownPlaced = copyFrom.numUnknownPlaced;
             numPlaced = copyFrom.numPlaced;
@@ -473,6 +479,17 @@ namespace FFTriadBuddy
         public TriadDeckInstanceScreen(TriadDeckInstanceScreen copyFrom)
         {
             cards = new TriadCard[copyFrom.cards.Length];
+            CopyFrom(copyFrom);
+        }
+
+        /// <summary>Leaves the instance in the same state as <c>new TriadDeckInstanceScreen(copyFrom)</c>.</summary>
+        internal void CopyFrom(TriadDeckInstanceScreen copyFrom)
+        {
+            if (cards == null || cards.Length != copyFrom.cards.Length)
+            {
+                cards = new TriadCard[copyFrom.cards.Length];
+            }
+
             for (int Idx = 0; Idx < copyFrom.cards.Length; Idx++)
             {
                 cards[Idx] = copyFrom.cards[Idx];

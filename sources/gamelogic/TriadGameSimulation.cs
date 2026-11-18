@@ -28,11 +28,12 @@ namespace FFTriadBuddy
 
         public const int boardSize = 3;
         public const int boardSizeSq = boardSize * boardSize;
+        private static readonly int CardTypeCount = Enum.GetNames(typeof(ETriadCardType)).Length;
 
         public TriadGameSimulationState()
         {
             board = new TriadCardInstance[boardSizeSq];
-            typeMods = new int[Enum.GetNames(typeof(ETriadCardType)).Length];
+            typeMods = new int[CardTypeCount];
             state = ETriadGameState.InProgressBlue;
             resolvedSpecial = ETriadGameSpecialMod.None;
             numCardsPlaced = 0;
@@ -67,6 +68,120 @@ namespace FFTriadBuddy
             numRestarts = copyFrom.numRestarts;
             resolvedSpecial = copyFrom.resolvedSpecial;
             // bDebugRules not copied, only first step needs it
+        }
+    }
+
+    /// <summary>
+    /// A state overwritten in place by <see cref="CopyFrom"/> for many consecutive searches or rollouts on one thread,
+    /// instead of allocating a state, two deck instances and a card instance per placement every time.
+    /// Contract: after CopyFrom runs, nothing may still use the previous contents' board or deck instances, and an
+    /// instance is only used by one thread at a time. The copy constructor never hands out these instances.
+    /// </summary>
+    public sealed class TriadRecycledSimulationState : TriadGameSimulationState
+    {
+        [ThreadStatic] private static TriadRecycledSimulationState rolloutState;
+
+        private TriadCardInstance[] cardSlots = new TriadCardInstance[boardSizeSq];
+        private TriadDeckInstanceManual recycledManualBlue;
+        private TriadDeckInstanceManual recycledManualRed;
+        private TriadDeckInstanceScreen recycledScreenBlue;
+        private TriadDeckInstanceScreen recycledScreenRed;
+        private List<int> comboScratch;
+        private List<int> nextComboScratch;
+
+        // Only for leaf work that never nests on the same thread (one random rollout at a time).
+        internal static TriadRecycledSimulationState ForRolloutOnCurrentThread() => rolloutState ??= new TriadRecycledSimulationState();
+
+        /// <summary>Same field values as <c>new TriadGameSimulationState(copyFrom)</c>, including forcedCardIdx = 0 and bDebugRules = false.</summary>
+        internal void CopyFrom(TriadGameSimulationState copyFrom)
+        {
+            if (board.Length != copyFrom.board.Length)
+            {
+                board = new TriadCardInstance[copyFrom.board.Length];
+                cardSlots = new TriadCardInstance[copyFrom.board.Length];
+            }
+
+            for (int Idx = 0; Idx < board.Length; Idx++)
+            {
+                var source = copyFrom.board[Idx];
+                if (source == null)
+                {
+                    board[Idx] = null;
+                    continue;
+                }
+
+                var copy = RentCardInstance(Idx, source.card, source.owner);
+                copy.scoreModifier = source.scoreModifier;
+                board[Idx] = copy;
+            }
+
+            if (typeMods.Length != copyFrom.typeMods.Length)
+            {
+                typeMods = new int[copyFrom.typeMods.Length];
+            }
+
+            Array.Copy(copyFrom.typeMods, typeMods, typeMods.Length);
+
+            deckBlue = CopyDeck(copyFrom.deckBlue, ref recycledManualBlue, ref recycledScreenBlue);
+            deckRed = CopyDeck(copyFrom.deckRed, ref recycledManualRed, ref recycledScreenRed);
+            state = copyFrom.state;
+            numCardsPlaced = copyFrom.numCardsPlaced;
+            numRestarts = copyFrom.numRestarts;
+            resolvedSpecial = copyFrom.resolvedSpecial;
+            forcedCardIdx = 0;
+            bDebugRules = false;
+        }
+
+        private static TriadDeckInstance CopyDeck(TriadDeckInstance source, ref TriadDeckInstanceManual manual, ref TriadDeckInstanceScreen screen)
+        {
+            // Exact type checks: CreateCopy is virtual, so a subclass keeps getting its own copy.
+            if (source != null && source.GetType() == typeof(TriadDeckInstanceManual))
+            {
+                var sourceManual = (TriadDeckInstanceManual)source;
+                if (manual == null) { manual = new TriadDeckInstanceManual(sourceManual); } else { manual.CopyFrom(sourceManual); }
+                return manual;
+            }
+
+            if (source != null && source.GetType() == typeof(TriadDeckInstanceScreen))
+            {
+                var sourceScreen = (TriadDeckInstanceScreen)source;
+                if (screen == null) { screen = new TriadDeckInstanceScreen(sourceScreen); } else { screen.CopyFrom(sourceScreen); }
+                return screen;
+            }
+
+            return source.CreateCopy();
+        }
+
+        // Both lists only live inside one PlaceCard call; the capture rules add to them and never keep them.
+        internal List<int> RentComboList()
+        {
+            comboScratch ??= new List<int>();
+            comboScratch.Clear();
+            return comboScratch;
+        }
+
+        internal List<int> RentNextComboList()
+        {
+            nextComboScratch ??= new List<int>();
+            nextComboScratch.Clear();
+            return nextComboScratch;
+        }
+
+        // A board position is only filled while empty, so one instance per position is never on the board twice.
+        internal TriadCardInstance RentCardInstance(int boardPos, TriadCard card, ETriadCardOwner owner)
+        {
+            var slot = cardSlots[boardPos];
+            if (slot == null)
+            {
+                slot = new TriadCardInstance(card, owner);
+                cardSlots[boardPos] = slot;
+            }
+            else
+            {
+                slot.Reinitialize(card, owner);
+            }
+
+            return slot;
         }
     }
 
@@ -145,7 +260,8 @@ namespace FFTriadBuddy
             TriadCard card = cardDeck.GetCard(cardIdx);
             if (bIsAllowedOwner && (boardPos >= 0) && (gameState.board[boardPos] == null) && (card != null))
             {
-                gameState.board[boardPos] = new TriadCardInstance(card, owner);
+                var recycled = gameState as TriadRecycledSimulationState;
+                gameState.board[boardPos] = (recycled != null) ? recycled.RentCardInstance(boardPos, card, owner) : new TriadCardInstance(card, owner);
                 gameState.numCardsPlaced++;
 
                 if (owner == ETriadCardOwner.Blue)
@@ -172,22 +288,28 @@ namespace FFTriadBuddy
                     }
                 }
 
-                List<int> comboList = new List<int>();
+                // Only CaptureNei rules fill the first combo list (later steps only add what earlier steps captured),
+                // so without them it would stay empty and the combo loop could not run.
+                List<int> comboList = ((modFeatures & TriadGameModifier.EFeature.CaptureNei) != 0) ?
+                    (recycled != null ? recycled.RentComboList() : new List<int>()) :
+                    null;
                 int comboCounter = 0;
                 CheckCaptures(gameState, boardPos, comboList, comboCounter);
 
-                while (bAllowCombo && comboList.Count > 0)
+                List<int> nextCombo = null;
+                while (bAllowCombo && comboList != null && comboList.Count > 0)
                 {
                     if (gameState.bDebugRules) { Logger.WriteLine(">> combo step: {0}", string.Join(",", comboList)); }
 
-                    List<int> nextCombo = new List<int>();
+                    nextCombo ??= (recycled != null ? recycled.RentNextComboList() : new List<int>());
+                    nextCombo.Clear();
                     comboCounter++;
                     foreach (int pos in comboList)
                     {
                         CheckCaptures(gameState, pos, nextCombo, comboCounter);
                     }
 
-                    comboList = nextCombo;
+                    (comboList, nextCombo) = (nextCombo, comboList);
                 }
 
                 if ((modFeatures & TriadGameModifier.EFeature.PostCapture) != 0)

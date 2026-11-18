@@ -1,5 +1,6 @@
 ﻿using MgAl2O4.Utils;
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
@@ -163,6 +164,12 @@ namespace FFTriadBuddy
         protected int sessionSeed = 0;
         private Random failsafeRandStream = null;
 
+        // One reusable copy per search depth. Only the thread that claimed searchStatesOwner on entry uses them, and not
+        // inside a call nested in its own search; everyone else gets a fresh copy as before.
+        private readonly List<TriadRecycledSimulationState> searchStates = new List<TriadRecycledSimulationState>();
+        private int searchStatesOwner;
+        private int nestedSearchDepth;
+
         public override float GetProgress()
         {
             return currentProgress;
@@ -185,10 +192,40 @@ namespace FFTriadBuddy
             bool isFinished = IsFinished(gameState, out solverResult);
             if (!isFinished && IsInitialized())
             {
-                _ = SearchActionSpace(solver, gameState, 0, out cardIdx, out boardPos, out solverResult);
+                int threadId = Environment.CurrentManagedThreadId;
+                bool ownsSearchStates = Interlocked.CompareExchange(ref searchStatesOwner, threadId, 0) == 0;
+                bool nestedInOwnSearch = !ownsSearchStates && Volatile.Read(ref searchStatesOwner) == threadId;
+                if (nestedInOwnSearch) { nestedSearchDepth++; }
+                try
+                {
+                    _ = SearchActionSpace(solver, gameState, 0, out cardIdx, out boardPos, out solverResult);
+                }
+                finally
+                {
+                    if (nestedInOwnSearch) { nestedSearchDepth--; }
+                    if (ownsSearchStates) { Volatile.Write(ref searchStatesOwner, 0); }
+                }
             }
 
             return (cardIdx >= 0) && (boardPos >= 0);
+        }
+
+        // Same contents as new TriadGameSimulationState(source); the returned copy is only valid until the next call for this depth.
+        private TriadGameSimulationState CopyForSearch(TriadGameSimulationState source, int searchLevel)
+        {
+            if (Volatile.Read(ref searchStatesOwner) != Environment.CurrentManagedThreadId || nestedSearchDepth != 0)
+            {
+                return new TriadGameSimulationState(source);
+            }
+
+            while (searchStates.Count <= searchLevel)
+            {
+                searchStates.Add(new TriadRecycledSimulationState());
+            }
+
+            var copy = searchStates[searchLevel];
+            copy.CopyFrom(source);
+            return copy;
         }
 
         protected bool IsFinished(TriadGameSimulationState gameState, out SolverResult gameResult)
@@ -264,7 +301,7 @@ namespace FFTriadBuddy
                             continue;
                         }
 
-                        var gameStateCopy = new TriadGameSimulationState(gameState);
+                        var gameStateCopy = CopyForSearch(gameState, searchLevel);
                         var useDeck = (gameStateCopy.state == ETriadGameState.InProgressBlue) ? gameStateCopy.deckBlue : gameStateCopy.deckRed;
 
                         bool isPlaced = solver.simulation.PlaceCard(gameStateCopy, cardIdx, useDeck, turnOwner, boardIdx);
@@ -416,7 +453,8 @@ namespace FFTriadBuddy
             _ = Parallel.For(0, numWorkers, workerIdx =>
             //for (int workerIdx = 0; workerIdx < solverWorkers; workerIdx++)
             {
-                var gameStateCopy = new TriadGameSimulationState(gameState);
+                var gameStateCopy = TriadRecycledSimulationState.ForRolloutOnCurrentThread();
+                gameStateCopy.CopyFrom(gameState);
                 var agent = workerAgents[workerIdx];
 
                 solver.RunSimulation(gameStateCopy, agent, agent);
